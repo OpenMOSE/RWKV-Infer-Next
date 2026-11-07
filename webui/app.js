@@ -233,7 +233,10 @@ $("pSystem").onchange = (e) => { let c = conv(); if (!c) { newConv(); c = conv()
 $("pEnter").onchange = (e) => { ui.enterSend = e.target.checked; saveUi(); renderParams(); };
 document.querySelectorAll("[data-preset]").forEach((b) => b.onclick = () => {
   let c = conv(); if (!c) { newConv(); c = conv(); }
-  const pr = { precise: { temperature: 0, top_p: 1, top_k: 0, min_p: 0 }, balanced: { temperature: 1, top_p: 0.3, top_k: 0, min_p: 0 },
+  // every preset sets every sampling value: a value left over from another preset (e.g. Creative's penalties)
+  // would silently change what the next one does
+  const pr = { precise: { temperature: 0, top_p: 1, top_k: 0, min_p: 0, presence_penalty: 0, frequency_penalty: 0 },
+    balanced: { temperature: 1, top_p: 0.3, top_k: 0, min_p: 0, presence_penalty: 0, frequency_penalty: 0 },
     creative: { temperature: 1.1, top_p: 0.8, top_k: 0, min_p: 0.02, presence_penalty: 0.3, frequency_penalty: 0.3 }, reset: null }[b.dataset.preset];
   c.params = pr ? Object.assign({}, c.params || {}, pr) : null; saveConvs(); renderParams(); toast(pr ? `Preset: ${b.textContent}` : "Back to the server defaults");
 });

@@ -13,8 +13,14 @@ rank 0                                         ranks > 0
 The workers get the drafts and the accepted counts through collectives inside their graph, so they
 need no host round trip at all; rank 0 reads picks / n once per step (one sync). The emitted tokens
 are the sampler's choices at each position, so the output distribution is the plain decode's.
-Rows with presence / frequency penalties take the plain path instead (their penalty state would have
-to advance position by position).
+
+Sampling in the graph covers every setting the eager sampler (sampler.py) does, exactly:
+- top-p / top-k <= PREFILTER: the top PREFILTER logits, sorted;
+- no truncation (top-p 1, no top-k; "full" rows): Gumbel-max over the whole vocabulary above the min-p cut;
+- presence / frequency penalties: the penalty table advances position by position along the drafts
+  (position i sees the counts after drafts 0..i-1, which is what the plain decode would see if they are
+  accepted), and the accepted tokens are committed to the table in the graph.
+Only top-k > PREFILTER takes the eager path.
 """
 
 from __future__ import annotations
@@ -26,8 +32,9 @@ import torch
 PREFILTER = 1024
 
 
-def sample_graph(x, temp, top_p, top_k, min_p):
-    """Graph-safe batched sampling: x (M, V) fp32, per-row params (M,). temp <= 0 -> greedy."""
+def sample_graph(x, temp, top_p, top_k, min_p, full):
+    """Graph-safe batched sampling: x (M, V) fp32, per-row params (M,). temp <= 0 -> greedy.
+    full (M,) bool: rows without top-p / top-k truncation, sampled from the whole vocabulary."""
     M = x.shape[0]
     K = min(PREFILTER, x.shape[-1])
     v, idx = x.topk(K, dim=-1)
@@ -44,20 +51,54 @@ def sample_graph(x, temp, top_p, top_k, min_p):
     u = torch.rand(M, 1, device=x.device) * cdf[:, -1:]
     j = (cdf < u).sum(-1).clamp(max=K - 1)
     out = idx.gather(1, j.view(M, 1)).view(M)
+    # full rows: Gumbel-max over every token with p >= min_p * p_max (z - z_max >= log min_p); exact categorical
+    z = x / t
+    cut = z.amax(-1, keepdim=True) + torch.log(min_p.view(M, 1))
+    g = -torch.log(-torch.log(torch.rand_like(z)))
+    outf = torch.where(z >= cut, z + g, torch.full_like(z, float("-inf"))).argmax(-1)
+    out = torch.where(full, outf, out)
     return torch.where(greedy, idx[:, 0], out)
+
+
+def penalize_positions(lg, c, toks, pres, freq, decay):
+    """lg (B, T, V) fp32 logits of a verify step whose inputs are toks (B, T) = [t | drafts]; c (B, V) the
+    penalty counts after t. Position i sees the counts after drafts 1..i (what plain decoding would hold if
+    they were the emitted tokens): c_0 = c, c_i = c_{i-1} * decay + onehot(toks[:, i]).
+    -> (penalised logits, cs (B, T, V))"""
+    B, T, V = lg.shape
+    dec = decay.view(B, 1)
+    one = torch.ones(B, 1, device=c.device, dtype=c.dtype)
+    cs = [c]
+    for i in range(1, T):
+        cs.append((cs[-1] * dec).scatter_add(1, toks[:, i:i + 1], one))
+    cs = torch.stack(cs, 1)
+    return lg - pres.view(B, 1, 1) * (cs > 0).float() - freq.view(B, 1, 1) * cs, cs
+
+
+def commit_counts(c, cs, picks, j, decay, pen):
+    """write back the counts after the n = j + 1 emitted tokens picks[:, :n] (rows where pen): c_j * decay +
+    onehot(picks[:, j]), the update the plain sampler makes per token."""
+    B, T, V = cs.shape
+    cl = cs.gather(1, j.view(B, 1, 1).expand(B, 1, V)).squeeze(1)
+    new = (cl * decay.view(B, 1)).scatter_add(1, picks.gather(1, j.view(B, 1)), torch.ones(B, 1, device=c.device, dtype=c.dtype))
+    c.copy_(torch.where(pen.view(B, 1), new, c))
 
 
 class SpecGraphs:
     """All (Bg, K) spec-step graphs of one rank. Rank 0 passes the DraftPool, the others None."""
 
-    def __init__(self, model, pool):
-        self.m, self.pool = model, pool
+    def __init__(self, model, pool, counts=None):
+        """counts: rank 0's penalty table (sampler.Sampler.counts, (S, V)), read and advanced in the graph"""
+        self.m, self.pool, self.counts = model, pool, counts
         self.tp = model.tp
         self.graphs = {}
         S, dev = model.slots, model.device
         self.t_in = torch.zeros(S, dtype=torch.long, device=dev)
         self.temp = torch.zeros(S, device=dev); self.top_p = torch.ones(S, device=dev)
         self.top_k = torch.zeros(S, dtype=torch.long, device=dev); self.min_p = torch.zeros(S, device=dev)
+        self.full = torch.zeros(S, dtype=torch.bool, device=dev)
+        self.pres = torch.zeros(S, device=dev); self.freq = torch.zeros(S, device=dev)
+        self.decay = torch.ones(S, device=dev); self.pen = torch.zeros(S, dtype=torch.bool, device=dev)
         self.toks = {}          # K -> (S, K+1) long
         self.n_buf = torch.ones(S, dtype=torch.long, device=dev)
         self.mem = None
@@ -75,10 +116,18 @@ class SpecGraphs:
         picks = j = None
         if pool is not None:
             lg = m.head(h.reshape(B * T, m.C)).float()
+            cs = None
+            if self.counts is not None:                  # penalties: counts after drafts 0..i-1 at position i
+                lg, cs = penalize_positions(lg.view(B, T, -1), self.counts[:B], toks, self.pres[:B], self.freq[:B],
+                                            self.decay[:B])
+                lg = lg.view(B * T, -1)
             rep = lambda v: v[:B].repeat_interleave(T)
-            picks = sample_graph(lg, rep(self.temp), rep(self.top_p), rep(self.top_k), rep(self.min_p)).view(B, T)
+            picks = sample_graph(lg, rep(self.temp), rep(self.top_p), rep(self.top_k), rep(self.min_p),
+                                 rep(self.full)).view(B, T)
             j = (picks[:, :K] == drafts).long().cumprod(1).sum(1)
             self.n_buf[:B].copy_(j + 1)
+            if cs is not None:                           # commit the n emitted tokens (rows with penalties only)
+                commit_counts(self.counts[:B], cs, picks, j, self.decay[:B], self.pen[:B])
         self.tp.broadcast(self.n_buf[:B])
         m.rollback(rec, self.n_buf[:B], B)
         if pool is not None:
@@ -123,6 +172,14 @@ class SpecGraphs:
         self.top_p[:Bg].copy_(torch.tensor([p["top_p"] if 0 < p["top_p"] < 1 else 1.0 for p in params] + [1.0] * (Bg - B)), non_blocking=True)
         self.top_k[:Bg].copy_(torch.tensor([p["top_k"] or 0 for p in params] + [0] * (Bg - B)), non_blocking=True)
         self.min_p[:Bg].copy_(torch.tensor([p["min_p"] for p in params] + [0.0] * (Bg - B)), non_blocking=True)
+        from .sampler import needs_full_vocab
+        pad = [False] * (Bg - B)
+        self.full[:Bg].copy_(torch.tensor([needs_full_vocab(p) for p in params] + pad), non_blocking=True)
+        self.pres[:Bg].copy_(torch.tensor([float(p["presence_penalty"]) for p in params] + [0.0] * (Bg - B)), non_blocking=True)
+        self.freq[:Bg].copy_(torch.tensor([float(p["frequency_penalty"]) for p in params] + [0.0] * (Bg - B)), non_blocking=True)
+        self.decay[:Bg].copy_(torch.tensor([float(p["penalty_decay"]) for p in params] + [1.0] * (Bg - B)), non_blocking=True)
+        self.pen[:Bg].copy_(torch.tensor([bool(p["presence_penalty"] or p["frequency_penalty"]) for p in params] + pad),
+                            non_blocking=True)
         g, picks = self.graphs[(Bg, K)]
         g.replay()
         out = torch.cat([picks[:B], self.n_buf[:B].unsqueeze(1)], 1).tolist()      # one sync

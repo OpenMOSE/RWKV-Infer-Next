@@ -501,8 +501,9 @@ interleaved with decode.
 ### 4.3 Decode step (`_decode_step`)
 
 - `limit = min(self.pre) if self.pre else S`, `ids = [r.pending]`.
-- When MTP is loaded, `K = k_for(k_rules, B)`. If `K > 0` and no row in the batch has a presence or frequency
-  penalty, the step goes to `_spec_step` (§5). Otherwise it is plain:
+- When MTP is loaded, `K = k_for(k_rules, B)`. If `K > 0`, the step goes to `_spec_step` (§5): graphed when
+  `specg.pick` finds a graph and no row has `top_k > PREFILTER`, else eager. The eager spec step has no penalty
+  state, so a batch with a presence or frequency penalty and no fitting graph is plain. Otherwise it is plain:
   `logits, H = call("decode", ids, B, limit)`, then `Sampler(logits, params, slots=[0..B))`. With MTP loaded,
   `pool.plain_step(B, H, ids)` also commits `(H_prev, token)` to the drafter, so its state stays current even on
   plain steps.
@@ -525,7 +526,8 @@ seeded `0x5EED`. `__call__(logits, params, slots=None)`:
 1. Penalties are applied only when some row has a presence or frequency penalty and `slots` is given:
    `x -= presence·(c>0) + frequency·c`.
 2. If every row is greedy (`temperature ≤ 1e-6`), the result is `argmax`.
-3. Otherwise: `topk(1024)` prefilter (`PREFILTER`), `softmax(v / T)` over those 1024, then masks: rank `< top_k`
+3. Otherwise: `topk(K)` with `K = 1024` (`PREFILTER`), or the whole vocabulary when some row has no top-p / top-k
+   truncation (`needs_full_vocab`), `softmax(v / T)` over those K, then masks: rank `< top_k`
    (0 = off), the exclusive cumulative sum `< top_p` (values outside (0,1) mean off), `p ≥ min_p·p_max`, and the
    top token is always kept. Then inverse-CDF sampling with one uniform per row. Greedy rows in a mixed batch take
    `argmax`.
@@ -635,7 +637,7 @@ maps to).
 sequenceDiagram
   participant R0 as rank 0 graph
   participant Wk as worker graph
-  Note over R0: t_in, temp, top_p, top_k, min_p staged (run_rank0)
+  Note over R0: t_in, temp, top_p, top_k, min_p, full, penalties staged (run_rank0)
   R0->>R0: drafts = pool.draft(B, t_in, K)  (commit (H,t), chain K)
   R0->>R0: toks[:,0]=t_in, toks[:,1:]=drafts
   R0-->>Wk: NCCL broadcast(toks (B, K+1))
@@ -643,14 +645,14 @@ sequenceDiagram
     R0->>R0: forward_verify(toks) compiled layers, 2 all-reduces / layer
     Wk->>Wk: forward_verify(toks)
   end
-  R0->>R0: logits = head(h) over B*(K+1); picks = sample_graph(...) at every position
+  R0->>R0: logits = head(h) over B*(K+1), minus penalties from per-position counts; picks = sample_graph(...)
   R0->>R0: j = cumprod(picks[:, :K] == drafts).sum(1); n_buf = j+1
   R0-->>Wk: NCCL broadcast(n_buf (B,))
   par every rank
     R0->>R0: rollback(rec, n): wkv7_replay first n steps in place, shifts at n-1
     Wk->>Wk: rollback(rec, n)
   end
-  R0->>R0: pool.accept_graph(B, H, drafts, j)
+  R0->>R0: counts[:B] advanced by the n emitted tokens (rows with penalties); pool.accept_graph(B, H, drafts, j)
   Note over R0: host reads cat(picks, n) with one .tolist()
 ```
 
@@ -661,6 +663,13 @@ sequenceDiagram
 - `run_rank0` copies the inputs, replays, and does one sync (`torch.cat([picks, n]).tolist()`). `run_worker` only
   replays. The workers get the drafts and the accepted counts through the collectives inside their graph, so they
   never synchronise with the host.
+- Sampling in the graph (`sample_graph`) is exact for every setting but `top_k > PREFILTER`:
+  - truncated rows (top-p < 1 or top-k ≤ 1024) use the sorted top 1024, as `Sampler`;
+  - `full` rows (no truncation) take Gumbel-max over the whole vocabulary, restricted to `z ≥ z_max + log min_p`;
+  - penalties: rank 0's graph reads `Sampler.counts[:B]` and builds the counts each position sees,
+    `c_0 = c`, `c_i = c_{i-1}·decay + onehot(d_i)`, and subtracts `presence·(c_i>0) + frequency·c_i`. After `j` it
+    writes `c_j·decay + onehot(picks[j])` back for rows with a penalty. That is the table plain decoding would
+    hold after the same n tokens. Padding rows have zero penalties and are left unchanged.
 - The scheduler emits `picks[b][:n[b]]` token by token through `_emit` and stops early if a row finishes
   (`_spec_step`).
 - Eager fallback, used when `pick` returns None (for example, a prefill slot lies below the needed `Bg`): rank 0
@@ -686,8 +695,8 @@ rejection sampling's `min(1, p/q)`, but the drafter needs no probabilities of it
 
 Caveats that hold in the code:
 
-- Penalties: the spec path never applies penalties. A batch containing any row with presence or frequency
-  penalty takes the plain path (`_decode_step`). `penalty_decay` alone does not force the plain path.
+- Penalties: the graphed spec step applies them position by position (§5.5). The eager spec step does not, so a
+  batch with a penalty and no fitting graph takes the plain path (`_decode_step`).
 - RNG: `sample_graph` draws from the default CUDA generator (graph-safe), while `Sampler` uses its own seeded
   generator. Sampled outputs therefore have the same distribution but are not bit-identical between MTP and plain
   runs.
@@ -890,6 +899,7 @@ Environment variables outside the schema:
 | `tools/test_wkv7.py` | 1 GPU | `kernels/wkv7.py` against an fp64 PyTorch reference loop (and rwkvfla if installed): plain T=1/4/300 with and without initial state, the `triton_op`/torch.compile path, varlen packed prefill with per-sequence states, in-place rollback replay of the first n[b] steps |
 | `tools/test_template.py --model <folder>` | CPU, transformers | (1) our Jinja render == `tokenizer.apply_chat_template` over system, multi-turn, thinking on/off, tools, tool calls with object/string arguments, tool results, content parts; (2) trie tokenizer ids == the model tokenizer's on every rendered prompt; (3) parser on reasoning/content/tool-call outputs, including streaming in small pieces |
 | `tools/test_tp.py --ckpt <.pth> --check` | 2 GPUs (+ `RWKV_REF_HARNESS` for the optional external reference) | prefill of 3 prompts (one in two chunks) then 24 greedy decode steps: TP1 graph vs TP1 eager, TP2 vs TP1, and TP1 vs the external reference when given: max \|Δlogit\| and argmax agreement. `--bench` gives decode ms/step per batch size |
+| `tools/test_spec_sampling.py` | 1 GPU (or CPU) | the spec graph's sampling without a model: penalties advanced position by position + committed (`penalize_positions` / `commit_counts`) vs the sequential `Sampler`, tokens and table; full-vocabulary Gumbel-max vs softmax with a min-p cut |
 | `tools/test_engine.py --ckpt <model> [--mtp <sidecar> --chat]` | 1 GPU | in-process scheduler (TP1, `chan=None`): random arrivals into a small pool (forces waiting, chunked prefill, moves, padding, aborts), greedy with no stop id. Each request is re-run alone and compared token by token. A divergence passes only if the solo top-2 margin at that token is < 0.5. With `--mtp` the batched run uses speculative decoding (graphs, or `--eager_spec`) and reports tokens per row-step |
 | `tools/test_quality.py --ckpt --windows <npz>` | 2 GPUs | quantised configs (`int6`, `int8`, `+lora8`, `+att8`) vs bf16: ΔCE, KL(bf16‖q), top-1 agreement, weight GB |
 | `tools/test_server.py` | running server | N concurrent mixed requests (greedy duplicates, long prompt = chunked prefill, aborted streams, sampled): all finish, and greedy outputs match a solo run |
@@ -913,7 +923,7 @@ A code review on 2026-11-08 found the issues below. All were fixed the same day:
 | 6 | the quantised drafter kept its bf16 originals in VRAM | the bf16 copies of quantised matrices and of the draft head are freed |
 | 7 | engine-side failures returned HTTP 400; `/v1/completions` passed `error:*` as `finish_reason` | 503 for engine failures (400 only for bad requests); streamed completions end with an `error` event |
 | 8 | `_fail_streams` left the shared-memory channel linked | the channel is closed and unlinked there |
-| 9 | sampling pre-filtered the top 1024 logits even without top-p / top-k truncation | such rows sample over the whole vocabulary (eager sampler; the graphed spec step is skipped for them) |
+| 9 | sampling pre-filtered the top 1024 logits even without top-p / top-k truncation | such rows sample over the whole vocabulary (eager sampler: full sort; graphed spec step: Gumbel-max) |
 | 10 | the generation prefix was found by searching `Assistant:` in the whole prompt | it is the difference between the prompt rendered with and without `add_generation_prompt`; a continued message keeps its trailing whitespace |
 | 11 | autotune choices tuned at run time were never saved (ranks exit through `os._exit`); the file was named after device 0 | rank 0 calls `save_if_new()` while idle; the file is named after the rank's device |
 

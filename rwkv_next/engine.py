@@ -308,8 +308,14 @@ class Scheduler:
         params = [r.params for r in self.dec]
         from .mtp import k_for
         K = k_for(self.k_rules, B) if self.pool is not None else 0
-        if K > 0 and not any(p["presence_penalty"] or p["frequency_penalty"] for p in params):
-            return self._spec_step(events, B, K, ids, params, limit)
+        if K > 0:
+            pen = any(p["presence_penalty"] or p["frequency_penalty"] for p in params)
+            sg = self.ex.specg
+            from .spec import PREFILTER
+            # the spec graph samples every setting exactly but top-k > PREFILTER (spec.py)
+            Bg = sg.pick(B, K, limit) if sg is not None and all((p["top_k"] or 0) <= PREFILTER for p in params) else None
+            if Bg is not None or not pen:            # the eager spec step has no penalty state: penalties go plain
+                return self._spec_step(events, B, K, ids, params, limit, Bg)
         logits, H = self.call("decode", ids, B, limit)
         toks = self.ex.sampler(logits, params, list(range(B))).tolist()
         if self.pool is not None:
@@ -319,15 +325,10 @@ class Scheduler:
             self._emit(r, t, events)
         self._reap()
 
-    def _spec_step(self, events, B, K, ids, params, limit):
+    def _spec_step(self, events, B, K, ids, params, limit, Bg=None):
         """Draft K tokens per row (rank 0), verify K+1 positions on every rank, sample every position, accept the
         matching prefix, roll every rank back to it. The emitted tokens are sampled by the normal sampler at
         each position, so the output distribution is the plain decode's."""
-        sg = self.ex.specg
-        from .sampler import needs_full_vocab
-        # the in-graph sampler pre-filters the top PREFILTER logits; rows that sample from the whole vocabulary
-        # (no top-p / top-k) take the eager step, whose sampler handles them exactly
-        Bg = sg.pick(B, K, limit) if sg is not None and not any(needs_full_vocab(p) for p in params) else None
         if Bg is not None:                                                  # the whole step is one graph per rank
             pl, nl = self.call("spec", Bg, K, B, ids, params)
             self.stats["steps"] += 1
@@ -436,12 +437,13 @@ def rank_main(rank, world, cfg, chan_name, in_q, out_q, port):
         if cfg.get("COMPILE"):
             m.compile(sizes)
         m.capture_decode(sizes, verbose=(rank == 0))
-        specg = None
+        specg = sampler = None
         if cfg.get("MTP_PATH"):
             # one spec-step graph per (graph size b, every K that some real batch B in (prev, b] maps to);
             # every rank captures the same list in the same order (the collectives pair up)
             from .spec import SpecGraphs
-            specg = SpecGraphs(m, pool)
+            sampler = Sampler(S, m.V, dev) if rank == 0 else None
+            specg = SpecGraphs(m, pool, counts=sampler.counts if sampler is not None else None)
             prev = 0
             for b in sizes:
                 for K in sorted({k_for(rules, B) for B in range(prev + 1, b + 1)} - {0}):
@@ -466,7 +468,7 @@ def rank_main(rank, world, cfg, chan_name, in_q, out_q, port):
                 pass
         chan = Channel(chan_name, world - 1) if world > 1 else None
         if rank == 0:
-            ex = Executor(m, Sampler(S, m.V, dev), pool)
+            ex = Executor(m, sampler or Sampler(S, m.V, dev), pool)
             ex.specg = specg
             info = {"model": cfg.get("MODEL_LABEL") or os.path.basename(cfg["MODEL_PATH"]), "tp": world, "quant": cfg["QUANT"],
                     "mtp": ((pool.base_model or os.path.basename(cfg["MTP_PATH"].rstrip("/"))) + f" ({os.path.basename(cfg['MTP_PATH'].rstrip('/'))})"

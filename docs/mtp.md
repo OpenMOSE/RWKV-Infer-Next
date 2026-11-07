@@ -283,8 +283,14 @@ Rank 0 synchronises with the host once per step, to read `picks` and `n`. The wo
 ### 4.3 When the plain path is used instead
 
 - **K = 0:** the K rule (§5) gives K = 0 for this batch size.
-- **Penalties:** any row in the batch uses a presence or frequency penalty, whose state would have to advance position by position.
-- **No captured graph fits:** an eager speculative step (same math) is used.
+- **No captured graph fits:** an eager speculative step (same math) is used. That step has no penalty state, so a batch where some row uses a presence or frequency penalty goes plain in this case.
+
+The graphed step samples exactly for every setting except `top_k` > 1024:
+- top-p / top-k truncation uses the top 1024 logits;
+- no truncation uses Gumbel-max over the whole vocabulary;
+- presence / frequency penalties: the penalty counts advance position by position along the drafts, and the accepted tokens are committed inside the graph.
+
+Penalties and full-vocabulary sampling therefore keep the MTP speed-up.
 
 ---
 
