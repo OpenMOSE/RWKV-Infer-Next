@@ -1,0 +1,8 @@
+torch>=2.6
+triton>=3.2
+fastapi
+uvicorn
+jinja2>=3.1
+safetensors
+numpy
+huggingface_hub>=0.24

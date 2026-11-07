@@ -1,0 +1,114 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>RWKV-Infer-Next</title>
+<link rel="icon" type="image/png" href="/ui/favicon.png">
+<link rel="stylesheet" href="/ui/style.css?v=3">
+<script src="/ui/marked.min.js"></script>
+<script src="/ui/purify.min.js"></script>
+</head>
+<body>
+<div class="app" id="app">
+  <aside class="side" id="side">
+    <div class="side-head">
+      <div class="brand"><img class="brand-mark" src="/ui/icon.png" alt="">RWKV <small>Infer-Next</small></div>
+      <button class="icon" id="newChat" title="New chat (Ctrl+Shift+O)" aria-label="New chat">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 5v14M5 12h14"/></svg></button>
+    </div>
+    <div class="side-search"><input id="search" type="search" placeholder="Search chats" aria-label="Search chats"></div>
+    <nav class="conv-list" id="convList" aria-label="Chats"></nav>
+    <div class="side-foot">
+      <button class="nav" data-view="chat" id="navChat">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>Chat</button>
+      <button class="nav" data-view="settings" id="navSettings">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M12 2v3M12 19v3M4.2 4.2l2.1 2.1M17.7 17.7l2.1 2.1M2 12h3M19 12h3M4.2 19.8l2.1-2.1M17.7 6.3l2.1-2.1"/></svg>Settings &amp; status</button>
+      <div style="display:flex;gap:4px;padding:4px 4px 0">
+        <button class="btn" id="exportBtn" title="Export all chats as JSON" style="flex:1;justify-content:center;font-size:12px">Export</button>
+        <button class="btn" id="importBtn" title="Import chats from JSON" style="flex:1;justify-content:center;font-size:12px">Import</button>
+        <button class="btn" id="themeBtn" title="Theme" aria-label="Theme" style="font-size:12px">◐</button>
+        <input type="file" id="importFile" accept="application/json" hidden>
+      </div>
+    </div>
+  </aside>
+
+  <main class="main">
+    <header class="topbar">
+      <button class="icon" id="sideToggle" title="Sidebar (Ctrl+B)" aria-label="Sidebar">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M9 4v16"/></svg></button>
+      <div class="title" id="title">Chat</div>
+      <span class="pill" id="engPill"><span class="dot"></span><span id="engText">Connecting…</span></span>
+      <span class="pill" id="speedPill" hidden></span>
+      <button class="icon" id="paramsToggle" title="Chat settings" aria-label="Chat settings">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 21v-7M4 10V3M12 21v-9M12 8V3M20 21v-5M20 12V3M1 14h6M9 8h6M17 16h6"/></svg></button>
+    </header>
+
+    <!-- chat view -->
+    <section class="chat-wrap" id="viewChat">
+      <div class="chat">
+        <div class="messages" id="messages"><div class="messages-inner" id="msgInner"></div></div>
+        <div class="composer">
+          <div class="composer-inner">
+            <textarea id="input" rows="1" placeholder="Message (Enter to send, Shift+Enter for a new line)" aria-label="Message"></textarea>
+            <div class="bar">
+              <div class="seg" role="group" aria-label="Thinking" id="thinkSeg">
+                <button data-v="auto" title="Server default">Thinking: default</button><button data-v="on" title="Reason first, then answer">On</button><button data-v="off" title="Answer directly">Off</button>
+              </div>
+              <button class="icon" id="attachBtn" title="Attach text files" aria-label="Attach files">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21.4 11.1l-9.2 9.2a6 6 0 0 1-8.5-8.5l9.2-9.2a4 4 0 0 1 5.7 5.7l-9.2 9.2a2 2 0 0 1-2.8-2.8l8.5-8.5"/></svg></button>
+              <input type="file" id="attachFile" hidden multiple>
+              <span class="hint grow" id="tokHint"></span>
+              <button class="btn" id="stopBtn" hidden>■ Stop</button>
+              <button class="btn primary" id="sendBtn">Send</button>
+            </div>
+          </div>
+        </div>
+      </div>
+      <aside class="params" id="params" hidden>
+        <h3>Chat settings</h3>
+        <div class="field"><label for="pSystem">System prompt</label><textarea id="pSystem" placeholder="Empty: the server default"></textarea></div>
+        <div class="field"><label for="pTemp">temperature <b id="vTemp"></b></label><input type="range" id="pTemp" min="0" max="2" step="0.05"></div>
+        <div class="field"><label for="pTopP">top_p <b id="vTopP"></b></label><input type="range" id="pTopP" min="0" max="1" step="0.01"></div>
+        <div class="field"><label for="pTopK">top_k (0 = off)</label><input type="number" id="pTopK" min="0" step="1"></div>
+        <div class="field"><label for="pMinP">min_p <b id="vMinP"></b></label><input type="range" id="pMinP" min="0" max="0.5" step="0.01"></div>
+        <div class="field"><label for="pPres">presence penalty <b id="vPres"></b></label><input type="range" id="pPres" min="0" max="2" step="0.05"></div>
+        <div class="field"><label for="pFreq">frequency penalty <b id="vFreq"></b></label><input type="range" id="pFreq" min="0" max="2" step="0.05"></div>
+        <div class="field"><label for="pMax">Max tokens</label><input type="number" id="pMax" min="1" step="1"></div>
+        <div class="presets">
+          <button data-preset="precise">Precise (greedy)</button><button data-preset="balanced">Balanced</button><button data-preset="creative">Creative</button><button data-preset="reset">Server defaults</button>
+        </div>
+        <div class="field"><label for="pEnter"><span>Enter sends (off: Ctrl+Enter)</span><input type="checkbox" id="pEnter"></label></div>
+      </aside>
+    </section>
+
+    <!-- settings view -->
+    <section class="page" id="viewSettings" hidden>
+      <div class="page-inner">
+        <div class="card" id="statusCard">
+          <h2>Engine</h2>
+          <dl class="kv" id="statusKv"></dl>
+          <div id="statusErr" class="errbox" hidden style="margin-top:10px"></div>
+          <div style="display:flex;gap:8px;margin-top:12px;flex-wrap:wrap">
+            <button class="btn" id="restartBtn">Restart engine</button>
+            <button class="btn danger" id="stopEngineBtn">Stop engine</button>
+          </div>
+        </div>
+        <div id="settingsForm" style="display:flex;flex-direction:column;gap:16px"></div>
+        <div class="savebar">
+          <span class="grow" id="saveHint">No changes</span>
+          <button class="btn" id="revertBtn">Revert</button>
+          <button class="btn" id="saveBtn">Save</button>
+          <button class="btn primary" id="saveRestartBtn">Save &amp; restart</button>
+        </div>
+        <div class="card"><h2>Log</h2><div class="log" id="engLog"></div></div>
+      </div>
+    </section>
+  </main>
+</div>
+<div class="picker" id="picker" hidden><div class="box"><div class="head" id="pickHead"></div><div class="list" id="pickList"></div>
+  <div style="padding:8px;border-top:1px solid var(--line);text-align:right"><button class="btn" id="pickClose">Close</button></div></div></div>
+<div class="toast" id="toast" hidden></div>
+<script src="/ui/app.js?v=4"></script>
+</body>
+</html>
