@@ -706,15 +706,17 @@ Caveats that hold in the code:
 
 ### 5.7 Measured MTP results
 
-Two sets of numbers exist. From the README: int6 + MTP with a sidecar trained for 25M tokens (about 1.9 tokens
-per step), TP2, single stream: 150–266 tok/s (plain about 136).
+Server benchmark of 6 chat prompts on 2026-11-08 (G1l int6, single stream, greedy / sampled, the published
+sidecars trained for 1.0B tokens; two-GPU rows are 2 PCIe GPUs without P2P). Full table: `docs/mtp.md` §6.
 
-Server benchmark of 6 chat prompts on 2026-11-07 (G1 int6, TP2, 2 PCIe GPUs without P2P, single stream):
-
-| Model | No MTP | With MTP sidecar |
+| Model | One GPU: no MTP → MTP | TP2: no MTP → MTP |
 |---|---|---|
-| G1 7.2B | 140 tok/s | 252–258 tok/s with a sidecar trained for 300M tokens (proofreading 274–339, en chat ~211, zh ~194–209) |
-| G1 13.3B | 78 tok/s | 119 tok/s (sidecar trained for 30M tokens), 134 tok/s (90M), 154 tok/s (270M, 2.0×) |
+| G1l 2.9B | 240 / 230 → 436 / 443 tok/s | 205 / 204 → 403 / 382 tok/s |
+| G1l 7.2B | 119 / 116 → 243 / 249 tok/s | 141 / 140 → 269 / 275 tok/s |
+| G1l 13.3B | 64 / 63 → 143 / 143 tok/s (`MAX_BATCH` 16) | 78 / 76 → 162 / 162 tok/s |
+
+Earlier sidecars, same benchmark: 7.2B with 300M tokens 226 / 223 tok/s on one GPU (252–258 on TP2); 13.3B with
+270M tokens 136 / 133 on one GPU (154 on TP2).
 
 ---
 

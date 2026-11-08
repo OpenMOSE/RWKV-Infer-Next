@@ -311,27 +311,31 @@ Why K shrinks with the batch size:
 ## 6. Measured
 
 Setup:
-- Models: G1 7.2B / 13.3B, int6, tensor parallel over two PCIe 16 GB GPUs without P2P.
-- Load: single stream, mean of 6 chat prompts (ja chat, proofreading, translation, en chat, code, zh).
-- Date: 2026-11-07/08.
+- Models: G1l 2.9B / 7.2B / 13.3B, int6, on one 16 GB GPU or tensor parallel over two PCIe 16 GB GPUs without P2P.
+- Load: single stream, mean of 6 chat prompts (ja chat, proofreading, translation, en chat, code, zh); greedy / sampled.
+- Sidecars: the published ones, trained for 1.0B tokens. Date: 2026-11-08.
 
-| Model | Sidecar training | No MTP | With MTP | Speed-up |
-|---|---|---|---|---|
-| 7.2B | 25M tokens | 140 tok/s | 191–196 tok/s | 1.4× |
-| 7.2B | 300M tokens | 140 tok/s | **252–258 tok/s** | **1.8×** |
-| 13.3B | 30M tokens | 78 tok/s | 119 tok/s | 1.5× |
-| 13.3B | 90M tokens | 78 tok/s | 134 tok/s | 1.7× |
-| 13.3B | 270M tokens | 78 tok/s | **154 tok/s** | **2.0×** |
-
-On **one** 16 GB GPU (int6, TP1):
-
-| Model | Slots (`MAX_BATCH`) | GPU memory | No MTP | With MTP | Speed-up |
+| Model | GPUs (`MAX_BATCH`) | GPU memory | No MTP | With MTP | Speed-up |
 |---|---|---|---|---|---|
-| 7.2B (300M sidecar) | 32 | 9.4 GB | 117 tok/s | 226–228 tok/s | 1.9× |
-| 13.3B (270M sidecar) | 16 (32 does not fit) | 14.5 GB | 63–64 tok/s | 136 tok/s | 2.1× |
+| 2.9B | one (32) | 5.1 GB | 240 / 230 tok/s | **436 / 443 tok/s** | **1.8–1.9×** |
+| 2.9B | two, TP2 (32) | ≈ 4 GB each | 205 / 204 tok/s | 403 / 382 tok/s | 1.9–2.0× |
+| 7.2B | one (32) | 9.4 GB | 119 / 116 tok/s | **243 / 249 tok/s** | **2.0–2.1×** |
+| 7.2B | two, TP2 (32) | ≈ 6 GB each | 141 / 140 tok/s | **269 / 275 tok/s** | 1.9–2.0× |
+| 13.3B | one (16; 32 does not fit) | 14.6 GB | 64 / 63 tok/s | **143 / 143 tok/s** | **2.2–2.3×** |
+| 13.3B | two, TP2 (32) | ≈ 9.5 GB each | 78 / 76 tok/s | **162 / 162 tok/s** | 2.1× |
 
-- **By prompt type:** acceptance is highest for proofreading (7.2B, 300M: 274–339 tok/s), and lowest for English chat and Chinese (≈ 200 tok/s).
-- **More training helps:** 25M → 300M tokens took the 7.2B from 1.4× to 1.8×.
+- **The 2.9B is faster on one GPU** than on two, with or without MTP: at this size the per-layer all-reduce over PCIe costs more than the split saves.
+- **By prompt type** (greedy, one GPU): acceptance is highest for proofreading and code, and lowest for English chat and Chinese. 2.9B: proofreading 559, en chat 323 tok/s; 7.2B: 268 / 211; 13.3B: 171 / 115.
+- **More training helps.** Same benchmark, one GPU:
+
+  | Model | Sidecar training | With MTP | Speed-up |
+  |---|---|---|---|
+  | 7.2B | 300M tokens | 226 / 223 tok/s | 1.9× |
+  | 7.2B | 1.0B tokens | 243 / 249 tok/s | 2.0–2.1× |
+  | 13.3B | 270M tokens | 136 / 133 tok/s | 2.1× |
+  | 13.3B | 1.0B tokens | 143 / 143 tok/s | 2.2–2.3× |
+
+  Earlier, on TP2: the 7.2B went from 1.4× (25M tokens) to 1.8× (300M); the 13.3B from 1.5× (30M) to 1.7× (90M) and 2.0× (270M).
 
 ---
 
@@ -344,7 +348,7 @@ Sidecars are trained outside this repository, with the main model frozen. The tr
 | Architecture arm | `kl:attn+d3+fuse+dd` |
 | Training windows | ctx 512 |
 | Optimiser | lr 1e-3 (warm-up 200 steps), AdamW β = (0.9, 0.99) without weight decay, gradient clip 1.0 |
-| Training length | 100–300M tokens of chat-heavy multilingual data |
+| Training length | 1.0B tokens of chat-heavy multilingual data for the published sidecars (gains continue past 300M, see §6) |
 | Main model during training | bf16, or weight-only int8 when it does not fit |
 | Packaging | `tools/export_mtp.py` (§2.1) |
 

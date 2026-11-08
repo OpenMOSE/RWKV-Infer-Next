@@ -28,9 +28,10 @@ batching on CUDA graphs, int6 weights and MTP speculative decoding, behind an Op
 pip install -r requirements.txt          # torch (CUDA), triton, fastapi, uvicorn, jinja2, safetensors, huggingface_hub
 
 # one command: download the model from Hugging Face (once), fetch its MTP sidecar, serve on :8000
+python -m rwkv_next --model RWKV/RWKV7-G1l-2.9B-20261031 --tp 1                    # one GPU (5.1 GB)
 python -m rwkv_next --model RWKV/RWKV7-G1l-7.2B-20261031 --tp 1                    # one 16 GB GPU (9.4 GB)
-python -m rwkv_next --model RWKV/RWKV7-G1l-13.3B-20261031 --tp 1 --max-batch 16    # one 16 GB GPU (14.5 GB)
-python -m rwkv_next --model RWKV/RWKV7-G1l-13.3B-20261031 --tp 2                   # two GPUs (~9 GB each)
+python -m rwkv_next --model RWKV/RWKV7-G1l-13.3B-20261031 --tp 1 --max-batch 16    # one 16 GB GPU (14.6 GB)
+python -m rwkv_next --model RWKV/RWKV7-G1l-13.3B-20261031 --tp 2                   # two GPUs (~9.5 GB each)
 
 # WebUI: http://localhost:8000/ui     API: http://localhost:8000/v1/chat/completions
 python -m rwkv_next --stop               # stop the server started from this directory (PID file)
@@ -106,12 +107,19 @@ server process is restarted, the others immediately.
 
 Full specification (drafter architecture, sidecar format, runtime protocol, measurements): [docs/mtp.md](docs/mtp.md).
 
-An MTP sidecar is a small drafter (one gated sliding-window attention block, ~250M parameters for a 4096-wide model)
-trained for ONE base model.
+An MTP sidecar is a small drafter (one gated sliding-window attention block: ~250M parameters for a 4096-wide model,
+~100M for the 2560-wide 2.9B) trained for ONE base model.
 
-**Published sidecars:** [OpenMOSE/RWKV7-MTP-Exp](https://huggingface.co/OpenMOSE/RWKV7-MTP-Exp) has sidecars for
-`RWKV/RWKV7-G1l-7.2B-20261031` (1.8× single-stream decode) and `RWKV/RWKV7-G1l-13.3B-20261031` (2.0×). They are
-picked automatically with `MTP_PATH=auto`. A sidecar repository is one folder per base model plus an `index.json`
+**Published sidecars:** [OpenMOSE/RWKV7-MTP-Exp](https://huggingface.co/OpenMOSE/RWKV7-MTP-Exp) has sidecars, each
+trained for 1.0B tokens, for these base models. They are picked automatically with `MTP_PATH=auto`.
+
+| Base model | One 16 GB GPU, int6: no MTP → MTP | Two GPUs (TP2): no MTP → MTP |
+|---|---|---|
+| `RWKV/RWKV7-G1l-2.9B-20261031` | 240 → 436–443 tok/s (1.8–1.9×) | 205 → 382–403 tok/s (one GPU is faster) |
+| `RWKV/RWKV7-G1l-7.2B-20261031` | 119 → 243–249 tok/s (2.0–2.1×) | 141 → 269–275 tok/s (1.9–2.0×) |
+| `RWKV/RWKV7-G1l-13.3B-20261031` | 64 → 143 tok/s (2.2×, `--max-batch 16`) | 78 → 162 tok/s (2.1×) |
+
+Single stream, mean of 6 chat prompts, greedy and sampled ([docs/mtp.md §6](docs/mtp.md#6-measured)). A sidecar repository is one folder per base model plus an `index.json`
 (`rwkv_next/hub.py`).
 
 **New models without their own sidecar:** `--mtp-force` / `RWKV_MTP_FORCE=1` picks the sidecar of the same width whose base model has the closest layer count. A layer-count mismatch only warns, and the tapped layers move to the same relative depth. A forced sidecar never changes the output, only the speed, and the speed-up depends on how close the new model is to the one the sidecar was trained on. A poorly matching sidecar can be slower than no MTP. Measured: the 7.2B sidecar forced onto the 13.3B model gave 66 tok/s against 78 tok/s without MTP.
@@ -155,7 +163,7 @@ ranks 1..N-1 (model shards)
 | int6, TP2 | **142** | **500** | **1453** | 2103 | **2608** |
 | bf16, TP2 | 86 | 292 | 979 | 1652 | 2266 |
 
-- int6 + MTP (sidecar trained for 25M tokens, ~1.9 tokens per step), TP2, single stream: 150–266 tok/s (plain ~136).
+- int6 + MTP, single stream: see [MTP sidecars](#mtp-sidecars) (G1l 7.2B with the 1.0B-token sidecar: 269–275 tok/s on TP2, plain ~141).
 - int6 quality vs bf16 on G1 7.2B: ΔCE +0.008, top-1 agreement 94.6% (int8: +0.001, 98.0%). `INT6_KEEP_INT8=att`: +0.003.
 - All-reduce over host shared memory costs 24–53 µs here; with NVLink / P2P, TP scales much better.
 - Prefill is compute bound: ~4.8K tok/s per GPU on the 7B.
